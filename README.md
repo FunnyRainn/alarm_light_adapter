@@ -1,4 +1,4 @@
-# Alarm Light Adapter
+# Alarm Light Adapter v0.2.0
 
 Small HTTP-to-serial adapter for the USB tower light and buzzer.
 
@@ -27,6 +27,28 @@ Coil mapping:
 - `POST /test`
 - `POST /alarm`
 - `POST /off`
+
+新版 `/alarm` 支持按事故租约控制：
+
+```json
+{
+  "station_id": "station_3",
+  "incident_id": "uuid",
+  "severity": "high",
+  "action": "raise",
+  "alarm": {"code": "B3"}
+}
+```
+
+`action` 可为 `raise / refresh / resolve`。每个事故默认租约 3 秒；Server
+应每秒发送一次 `refresh`。网络或 Server 失联后不再续租，适配器会自动关闭。
+并发事故始终采用未过期的最高等级，高等级结束后自动降级且不会重新蜂鸣。
+
+- `low`：黄灯闪烁，首次蜂鸣 0.5 秒。
+- `medium`：黄灯、红灯闪烁，首次蜂鸣 1 秒。
+- `high`：黄灯、红灯、绿灯闪烁，首次蜂鸣 2 秒。
+
+旧载荷不含 `incident_id/severity/action` 时仍按中度单次触发处理。
 
 For `act_web` station configuration, enable light alarm and use:
 

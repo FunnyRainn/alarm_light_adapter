@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import dataclass
 from datetime import datetime
 import os
-from typing import Any
+from typing import Any, Callable
 
 from .config import AdapterConfig
 from .modbus import write_single_coil_frame
@@ -27,13 +27,38 @@ class SerialLightController:
         self.last_command_at: str | None = None
 
     def all_on(self) -> None:
-        self.set_outputs(True)
+        self.set_channels(red=True, yellow=True, green=True, buzzer=True)
 
     def all_off(self) -> None:
-        self.set_outputs(False)
+        self.set_channels()
 
     def set_outputs(self, enabled: bool) -> None:
-        frames = [write_single_coil_frame(1, coil, enabled) for coil in COILS.values()]
+        """保留旧的全开/全关入口，内部改用明确通道组合。"""
+
+        self.set_channels(
+            red=enabled,
+            yellow=enabled,
+            green=enabled,
+            buzzer=enabled,
+        )
+
+    def set_channels(
+        self,
+        *,
+        red: bool = False,
+        yellow: bool = False,
+        green: bool = False,
+        buzzer: bool = False,
+    ) -> None:
+        """一次串口会话写完四个线圈，未选通道也显式关闭，避免残留状态。"""
+
+        states = {
+            "red": bool(red),
+            "yellow": bool(yellow),
+            "green": bool(green),
+            "buzzer": bool(buzzer),
+        }
+        frames = [write_single_coil_frame(1, coil, states[name]) for name, coil in COILS.items()]
         self._write_frames(frames)
 
     def health_check(self) -> dict[str, Any]:
@@ -90,7 +115,7 @@ class SerialLightController:
         )
 
     def config_snapshot(self) -> dict[str, Any]:
-        return asdict(self.config)
+        return self.config.snapshot()
 
 
 class _WinSerialPort:
@@ -251,72 +276,228 @@ class _WinSerialPort:
         raise OSError(error, f"Windows serial {action} failed")
 
 
+@dataclass
+class _AlarmLease:
+    """单个事故在适配器内的租约；严重等级可由 refresh 同步但不会触发蜂鸣。"""
+
+    severity: str
+    expires_at: float
+
+
 class AlarmPatternRunner:
-    def __init__(self, controller: SerialLightController, config: AdapterConfig) -> None:
+    """按 incident_id 维护租约并输出当前未过期事故中的最高等级模板。"""
+
+    _SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3}
+
+    def __init__(
+        self,
+        controller: SerialLightController,
+        config: AdapterConfig,
+        *,
+        clock: Callable[[], float] | None = None,
+        auto_start: bool = True,
+    ) -> None:
         self.controller = controller
         self.config = config
-        self._lock = threading.Lock()
+        self._clock = clock or time.monotonic
+        self._auto_start = bool(auto_start)
+        self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._deadline = 0.0
+        self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._active = False
+        self._leases: dict[str, _AlarmLease] = {}
+        self._buzz_deadlines: dict[str, float] = {}
+        self._last_outputs: tuple[bool, bool, bool, bool] | None = None
+        self._effective_severity: str | None = None
         self.last_triggered_at: str | None = None
+        self.last_action: str = ""
         self.last_error: str = ""
 
-    def trigger(self) -> None:
-        import time
+    def apply(self, *, incident_id: str, severity: str, action: str) -> None:
+        """执行 raise/refresh/resolve；只有一个全新的 incident 的 raise 会创建蜂鸣期限。"""
 
+        normalized_id = str(incident_id or "").strip()
+        normalized_severity = str(severity or "").strip().lower()
+        normalized_action = str(action or "").strip().lower()
+        if not normalized_id:
+            raise ValueError("incident_id is required")
+        if normalized_severity not in self._SEVERITY_ORDER:
+            raise ValueError(f"unsupported alarm severity: {severity}")
+        if normalized_action not in {"raise", "refresh", "resolve"}:
+            raise ValueError(f"unsupported alarm action: {action}")
+        now_value = self._clock()
         with self._lock:
-            self._deadline = time.monotonic() + self.config.alarm_duration_seconds
+            self._expire_locked(now_value)
+            existing = self._leases.get(normalized_id)
+            if normalized_action == "resolve":
+                self._leases.pop(normalized_id, None)
+                self._buzz_deadlines.pop(normalized_id, None)
+            else:
+                self._leases[normalized_id] = _AlarmLease(
+                    severity=normalized_severity,
+                    expires_at=now_value + self.config.lease_seconds,
+                )
+                if normalized_action == "raise" and existing is None:
+                    buzzer_seconds = self.config.profile(normalized_severity).buzzer_seconds
+                    if buzzer_seconds > 0:
+                        self._buzz_deadlines[normalized_id] = now_value + buzzer_seconds
             self.last_triggered_at = datetime.now().isoformat(timespec="milliseconds")
-            self._stop_event.clear()
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._run, name="alarm-light-pattern", daemon=True)
-                self._thread.start()
+            self.last_action = normalized_action
+            # 对一个本就不存在的事故执行幂等 resolve 时无需凭空启动常驻线程。
+            if self._auto_start and (
+                self._leases
+                or (self._thread is not None and self._thread.is_alive())
+            ):
+                self._ensure_thread_locked()
+        self._wake_event.set()
+
+    def trigger(self, *, incident_id: str = "legacy") -> None:
+        """旧 `/alarm` 的中度单次入口；同一租约内重复调用只续租。"""
+
+        self.apply(incident_id=incident_id, severity="medium", action="raise")
 
     def stop(self) -> None:
+        """清空全部租约、有界回收线程并保证所有线圈关闭。"""
+
+        with self._lock:
+            self._leases.clear()
+            self._buzz_deadlines.clear()
+            thread = self._thread
         self._stop_event.set()
+        self._wake_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         try:
             self.controller.all_off()
+            with self._lock:
+                self._last_outputs = (False, False, False, False)
+                self._effective_severity = None
             self.last_error = ""
         except Exception as exc:
             self.last_error = str(exc)
         finally:
-            self._active = False
+            with self._lock:
+                if thread is None or not thread.is_alive():
+                    self._thread = None
 
     def is_active(self) -> bool:
-        return self._active
+        """只根据未过期租约判断 active，不把线程存活误当业务报警。"""
+
+        with self._lock:
+            self._expire_locked(self._clock())
+            return bool(self._leases)
 
     def status(self) -> dict[str, Any]:
+        """返回健康接口所需的小型租约摘要，不暴露内部线程对象。"""
+
+        with self._lock:
+            self._expire_locked(self._clock())
+            effective = self._select_effective_locked()
+            lease_count = len(self._leases)
         return {
-            "active": self._active,
+            "active": bool(lease_count),
+            "lease_count": lease_count,
+            "effective_severity": effective,
             "last_triggered_at": self.last_triggered_at,
+            "last_action": self.last_action,
             "last_error": self.last_error,
         }
 
-    def _run(self) -> None:
-        import time
+    def tick(self) -> tuple[bool, bool, bool, bool]:
+        """计算并写出当前组合；公开该小步仅用于无串口、无 sleep 的确定性测试。"""
 
-        self._active = True
+        now_value = self._clock()
+        with self._lock:
+            self._expire_locked(now_value)
+            severity = self._select_effective_locked()
+            self._effective_severity = severity
+            lights_on = False
+            lights: tuple[str, ...] = ()
+            if severity is not None:
+                profile = self.config.profile(severity)
+                lights = profile.lights
+                cycle_seconds = (self.config.flash_on_ms + self.config.flash_off_ms) / 1000.0
+                phase_seconds = now_value % cycle_seconds
+                lights_on = phase_seconds < self.config.flash_on_ms / 1000.0
+            buzzer_on = any(deadline > now_value for deadline in self._buzz_deadlines.values())
+            desired = (
+                lights_on and "red" in lights,
+                lights_on and "yellow" in lights,
+                lights_on and "green" in lights,
+                buzzer_on,
+            )
+            unchanged = desired == self._last_outputs
+        if unchanged:
+            return desired
         try:
-            while not self._stop_event.is_set():
-                with self._lock:
-                    deadline = self._deadline
-                if time.monotonic() >= deadline:
-                    break
-                self.controller.all_on()
-                if self._stop_event.wait(self.config.flash_on_ms / 1000.0):
-                    break
-                self.controller.all_off()
-                if self._stop_event.wait(self.config.flash_off_ms / 1000.0):
-                    break
+            self.controller.set_channels(
+                red=desired[0],
+                yellow=desired[1],
+                green=desired[2],
+                buzzer=desired[3],
+            )
+            with self._lock:
+                self._last_outputs = desired
             self.last_error = ""
         except Exception as exc:
+            # 写失败时不更新 last_outputs，下一 tick 会再次尝试同一安全组合。
             self.last_error = str(exc)
+        return desired
+
+    def _run(self) -> None:
+        """轻量租约循环；状态不变时不会重复写串口。"""
+
+        try:
+            while not self._stop_event.is_set():
+                self.tick()
+                self._wake_event.wait(timeout=0.05)
+                self._wake_event.clear()
         finally:
             try:
                 self.controller.all_off()
             except Exception as exc:
                 self.last_error = str(exc)
             finally:
-                self._active = False
+                with self._lock:
+                    self._last_outputs = (False, False, False, False)
+                    self._effective_severity = None
+                    self._thread = None
+
+    def _ensure_thread_locked(self) -> None:
+        """幂等启动唯一 pattern 线程；`/off` 后的新事故可以重新启动。"""
+
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._wake_event.clear()
+        self._thread = threading.Thread(target=self._run, name="alarm-light-pattern", daemon=True)
+        self._thread.start()
+
+    def _expire_locked(self, now_value: float) -> None:
+        """清理到期事故及其蜂鸣期限，实现 Server/网络失联自动关闭。"""
+
+        expired_ids = [
+            incident_id
+            for incident_id, lease in self._leases.items()
+            if lease.expires_at <= now_value
+        ]
+        for incident_id in expired_ids:
+            self._leases.pop(incident_id, None)
+            self._buzz_deadlines.pop(incident_id, None)
+        expired_buzzers = [
+            incident_id
+            for incident_id, deadline in self._buzz_deadlines.items()
+            if deadline <= now_value
+        ]
+        for incident_id in expired_buzzers:
+            self._buzz_deadlines.pop(incident_id, None)
+
+    def _select_effective_locked(self) -> str | None:
+        """并发事故始终选择当前未过期的最高等级。"""
+
+        if not self._leases:
+            return None
+        return max(
+            (lease.severity for lease in self._leases.values()),
+            key=self._SEVERITY_ORDER.__getitem__,
+        )

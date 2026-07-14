@@ -36,6 +36,12 @@ def check_config_defaults() -> None:
         raise AssertionError("default serial port should be COM8")
     if cfg.baudrate != 9600:
         raise AssertionError("default baudrate should be 9600")
+    if cfg.lease_seconds != 3.0:
+        raise AssertionError("default incident lease should be 3 seconds")
+    if cfg.profile("low").lights != ("yellow",):
+        raise AssertionError("low profile should flash yellow")
+    if cfg.profile("high").buzzer_seconds != 2.0:
+        raise AssertionError("high profile should buzz for 2 seconds")
 
 
 def main() -> None:

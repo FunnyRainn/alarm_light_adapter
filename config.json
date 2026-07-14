@@ -4,8 +4,23 @@
   "serial_port": "COM8",
   "baudrate": 9600,
   "alarm_duration_seconds": 3.0,
+  "lease_seconds": 3.0,
   "flash_on_ms": 250,
   "flash_off_ms": 250,
   "read_timeout_seconds": 0.5,
-  "write_timeout_seconds": 0.5
+  "write_timeout_seconds": 0.5,
+  "profiles": {
+    "low": {
+      "lights": ["yellow"],
+      "buzzer_seconds": 0.5
+    },
+    "medium": {
+      "lights": ["yellow", "red"],
+      "buzzer_seconds": 1.0
+    },
+    "high": {
+      "lights": ["yellow", "red", "green"],
+      "buzzer_seconds": 2.0
+    }
+  }
 }
