@@ -12,10 +12,11 @@ _SEVERITIES = ("low", "medium", "high")
 
 @dataclass(frozen=True)
 class AlarmProfile:
-    """单个严重等级对应的灯光通道和首次蜂鸣时长。"""
+    """单个严重等级对应的灯光通道、蜂鸣时长和两次蜂鸣之间的停顿时长。"""
 
     lights: tuple[str, ...]
     buzzer_seconds: float
+    buzzer_pause_seconds: float
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], fallback: "AlarmProfile") -> "AlarmProfile":
@@ -28,16 +29,36 @@ class AlarmProfile:
         if not lights or any(item not in _ALLOWED_LIGHTS for item in lights):
             raise ValueError(f"invalid alarm profile lights: {raw_lights}")
         buzzer_seconds = max(0.0, float(data.get("buzzer_seconds", fallback.buzzer_seconds)))
-        return cls(lights=tuple(dict.fromkeys(lights)), buzzer_seconds=buzzer_seconds)
+        buzzer_pause_seconds = max(
+            0.0,
+            float(data.get("buzzer_pause_seconds", fallback.buzzer_pause_seconds)),
+        )
+        return cls(
+            lights=tuple(dict.fromkeys(lights)),
+            buzzer_seconds=buzzer_seconds,
+            buzzer_pause_seconds=buzzer_pause_seconds,
+        )
 
 
 def _default_profiles() -> dict[str, AlarmProfile]:
     """返回独立字典，避免不同配置实例共享可变容器。"""
 
     return {
-        "low": AlarmProfile(lights=("yellow",), buzzer_seconds=0.5),
-        "medium": AlarmProfile(lights=("yellow", "red"), buzzer_seconds=1.0),
-        "high": AlarmProfile(lights=("yellow", "red", "green"), buzzer_seconds=2.0),
+        "low": AlarmProfile(
+            lights=("yellow",),
+            buzzer_seconds=0.5,
+            buzzer_pause_seconds=2.0,
+        ),
+        "medium": AlarmProfile(
+            lights=("yellow", "red"),
+            buzzer_seconds=1.0,
+            buzzer_pause_seconds=2.0,
+        ),
+        "high": AlarmProfile(
+            lights=("yellow", "red", "green"),
+            buzzer_seconds=2.0,
+            buzzer_pause_seconds=2.0,
+        ),
     }
 
 

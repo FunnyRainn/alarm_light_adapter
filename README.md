@@ -1,4 +1,4 @@
-# Alarm Light Adapter v0.2.0
+# Alarm Light Adapter v0.2.1
 
 Small HTTP-to-serial adapter for the USB tower light and buzzer.
 
@@ -42,13 +42,16 @@ Coil mapping:
 
 `action` 可为 `raise / refresh / resolve`。每个事故默认租约 3 秒；Server
 应每秒发送一次 `refresh`。网络或 Server 失联后不再续租，适配器会自动关闭。
-并发事故始终采用未过期的最高等级，高等级结束后自动降级且不会重新蜂鸣。
+并发事故始终采用未过期的最高等级；等级升降时立即切换新等级模板。同等级新增事故和
+Server 的 `refresh` 只延长租约，不会重置当前蜂鸣周期。
 
-- `low`：黄灯闪烁，首次蜂鸣 0.5 秒。
-- `medium`：黄灯、红灯闪烁，首次蜂鸣 1 秒。
-- `high`：黄灯、红灯、绿灯闪烁，首次蜂鸣 2 秒。
+- `low`：黄灯闪烁，蜂鸣 0.5 秒、停顿 2 秒，事故持续时循环。
+- `medium`：黄灯、红灯闪烁，蜂鸣 1 秒、停顿 2 秒，事故持续时循环。
+- `high`：黄灯、红灯、绿灯闪烁，蜂鸣 2 秒、停顿 2 秒，事故持续时循环。
 
-旧载荷不含 `incident_id/severity/action` 时仍按中度单次触发处理。
+最后一个事故解除、租约过期或调用 `/off` 后会立即关闭并重置周期。旧载荷不含
+`incident_id/severity/action` 时仍按中度单次触发处理，`/test` 也保持单次蜂鸣，
+二者都不会自动进入循环。
 
 For `act_web` station configuration, enable light alarm and use:
 

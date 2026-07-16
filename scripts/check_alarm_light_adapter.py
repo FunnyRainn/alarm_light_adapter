@@ -42,6 +42,8 @@ def check_config_defaults() -> None:
         raise AssertionError("low profile should flash yellow")
     if cfg.profile("high").buzzer_seconds != 2.0:
         raise AssertionError("high profile should buzz for 2 seconds")
+    if any(cfg.profile(severity).buzzer_pause_seconds != 2.0 for severity in ("low", "medium", "high")):
+        raise AssertionError("all incident profiles should pause for 2 seconds")
 
 
 def main() -> None:

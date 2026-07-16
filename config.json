@@ -12,15 +12,18 @@
   "profiles": {
     "low": {
       "lights": ["yellow"],
-      "buzzer_seconds": 0.5
+      "buzzer_seconds": 0.5,
+      "buzzer_pause_seconds": 2.0
     },
     "medium": {
       "lights": ["yellow", "red"],
-      "buzzer_seconds": 1.0
+      "buzzer_seconds": 1.0,
+      "buzzer_pause_seconds": 2.0
     },
     "high": {
       "lights": ["yellow", "red", "green"],
-      "buzzer_seconds": 2.0
+      "buzzer_seconds": 2.0,
+      "buzzer_pause_seconds": 2.0
     }
   }
 }

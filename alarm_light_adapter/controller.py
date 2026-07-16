@@ -278,10 +278,11 @@ class _WinSerialPort:
 
 @dataclass
 class _AlarmLease:
-    """单个事故在适配器内的租约；严重等级可由 refresh 同步但不会触发蜂鸣。"""
+    """单个事故在适配器内的租约；新事故循环蜂鸣，旧接口只单次蜂鸣。"""
 
     severity: str
     expires_at: float
+    periodic_buzzer: bool
 
 
 class AlarmPatternRunner:
@@ -306,7 +307,11 @@ class AlarmPatternRunner:
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._leases: dict[str, _AlarmLease] = {}
-        self._buzz_deadlines: dict[str, float] = {}
+        # 旧 `/alarm` 与 `/test` 仍按单次蜂鸣截止时间执行，绝不进入事故循环。
+        self._one_shot_buzz_deadlines: dict[str, float] = {}
+        # 周期相位只属于当前最高等级，而不属于某个 incident，避免同级并发反复重启。
+        self._buzzer_cycle_severity: str | None = None
+        self._buzzer_cycle_started_at: float | None = None
         self._last_outputs: tuple[bool, bool, bool, bool] | None = None
         self._effective_severity: str | None = None
         self.last_triggered_at: str | None = None
@@ -314,7 +319,7 @@ class AlarmPatternRunner:
         self.last_error: str = ""
 
     def apply(self, *, incident_id: str, severity: str, action: str) -> None:
-        """执行 raise/refresh/resolve；只有一个全新的 incident 的 raise 会创建蜂鸣期限。"""
+        """执行新事故 raise/refresh/resolve；续租只延长到期时间，不直接改周期相位。"""
 
         normalized_id = str(incident_id or "").strip()
         normalized_severity = str(severity or "").strip().lower()
@@ -328,19 +333,15 @@ class AlarmPatternRunner:
         now_value = self._clock()
         with self._lock:
             self._expire_locked(now_value)
-            existing = self._leases.get(normalized_id)
             if normalized_action == "resolve":
                 self._leases.pop(normalized_id, None)
-                self._buzz_deadlines.pop(normalized_id, None)
+                self._one_shot_buzz_deadlines.pop(normalized_id, None)
             else:
                 self._leases[normalized_id] = _AlarmLease(
                     severity=normalized_severity,
                     expires_at=now_value + self.config.lease_seconds,
+                    periodic_buzzer=True,
                 )
-                if normalized_action == "raise" and existing is None:
-                    buzzer_seconds = self.config.profile(normalized_severity).buzzer_seconds
-                    if buzzer_seconds > 0:
-                        self._buzz_deadlines[normalized_id] = now_value + buzzer_seconds
             self.last_triggered_at = datetime.now().isoformat(timespec="milliseconds")
             self.last_action = normalized_action
             # 对一个本就不存在的事故执行幂等 resolve 时无需凭空启动常驻线程。
@@ -354,14 +355,36 @@ class AlarmPatternRunner:
     def trigger(self, *, incident_id: str = "legacy") -> None:
         """旧 `/alarm` 的中度单次入口；同一租约内重复调用只续租。"""
 
-        self.apply(incident_id=incident_id, severity="medium", action="raise")
+        normalized_id = str(incident_id or "").strip()
+        if not normalized_id:
+            raise ValueError("incident_id is required")
+        now_value = self._clock()
+        with self._lock:
+            self._expire_locked(now_value)
+            existing = self._leases.get(normalized_id)
+            self._leases[normalized_id] = _AlarmLease(
+                severity="medium",
+                expires_at=now_value + self.config.lease_seconds,
+                periodic_buzzer=False,
+            )
+            # 同一个旧接口租约内重复调用只续租；租约真正结束后再次调用才重新单次蜂鸣。
+            if existing is None:
+                buzzer_seconds = self.config.profile("medium").buzzer_seconds
+                if buzzer_seconds > 0:
+                    self._one_shot_buzz_deadlines[normalized_id] = now_value + buzzer_seconds
+            self.last_triggered_at = datetime.now().isoformat(timespec="milliseconds")
+            self.last_action = "raise"
+            if self._auto_start:
+                self._ensure_thread_locked()
+        self._wake_event.set()
 
     def stop(self) -> None:
         """清空全部租约、有界回收线程并保证所有线圈关闭。"""
 
         with self._lock:
             self._leases.clear()
-            self._buzz_deadlines.clear()
+            self._one_shot_buzz_deadlines.clear()
+            self._reset_buzzer_cycle_locked()
             thread = self._thread
         self._stop_event.set()
         self._wake_event.set()
@@ -372,6 +395,7 @@ class AlarmPatternRunner:
             with self._lock:
                 self._last_outputs = (False, False, False, False)
                 self._effective_severity = None
+                self._reset_buzzer_cycle_locked()
             self.last_error = ""
         except Exception as exc:
             self.last_error = str(exc)
@@ -419,7 +443,12 @@ class AlarmPatternRunner:
                 cycle_seconds = (self.config.flash_on_ms + self.config.flash_off_ms) / 1000.0
                 phase_seconds = now_value % cycle_seconds
                 lights_on = phase_seconds < self.config.flash_on_ms / 1000.0
-            buzzer_on = any(deadline > now_value for deadline in self._buzz_deadlines.values())
+            periodic_buzzer_on = self._periodic_buzzer_on_locked(now_value, severity)
+            one_shot_buzzer_on = any(
+                deadline > now_value
+                for deadline in self._one_shot_buzz_deadlines.values()
+            )
+            buzzer_on = periodic_buzzer_on or one_shot_buzzer_on
             desired = (
                 lights_on and "red" in lights,
                 lights_on and "yellow" in lights,
@@ -461,6 +490,7 @@ class AlarmPatternRunner:
                 with self._lock:
                     self._last_outputs = (False, False, False, False)
                     self._effective_severity = None
+                    self._reset_buzzer_cycle_locked()
                     self._thread = None
 
     def _ensure_thread_locked(self) -> None:
@@ -474,7 +504,7 @@ class AlarmPatternRunner:
         self._thread.start()
 
     def _expire_locked(self, now_value: float) -> None:
-        """清理到期事故及其蜂鸣期限，实现 Server/网络失联自动关闭。"""
+        """清理到期事故及其单次蜂鸣期限，实现 Server/网络失联自动关闭。"""
 
         expired_ids = [
             incident_id
@@ -483,14 +513,43 @@ class AlarmPatternRunner:
         ]
         for incident_id in expired_ids:
             self._leases.pop(incident_id, None)
-            self._buzz_deadlines.pop(incident_id, None)
+            self._one_shot_buzz_deadlines.pop(incident_id, None)
         expired_buzzers = [
             incident_id
-            for incident_id, deadline in self._buzz_deadlines.items()
+            for incident_id, deadline in self._one_shot_buzz_deadlines.items()
             if deadline <= now_value
         ]
         for incident_id in expired_buzzers:
-            self._buzz_deadlines.pop(incident_id, None)
+            self._one_shot_buzz_deadlines.pop(incident_id, None)
+
+    def _periodic_buzzer_on_locked(self, now_value: float, severity: str | None) -> bool:
+        """按当前最高等级计算事故蜂鸣周期；刷新和同级并发不会改变周期起点。"""
+
+        has_periodic_lease = severity is not None and any(
+            lease.periodic_buzzer and lease.severity == severity
+            for lease in self._leases.values()
+        )
+        if severity is None or not has_periodic_lease:
+            self._reset_buzzer_cycle_locked()
+            return False
+
+        # 只有最高等级发生变化，或此前只有旧单次租约时，才立即启动一个新等级周期。
+        if self._buzzer_cycle_severity != severity or self._buzzer_cycle_started_at is None:
+            self._buzzer_cycle_severity = severity
+            self._buzzer_cycle_started_at = now_value
+
+        profile = self.config.profile(severity)
+        cycle_seconds = profile.buzzer_seconds + profile.buzzer_pause_seconds
+        if profile.buzzer_seconds <= 0 or cycle_seconds <= 0:
+            return False
+        elapsed_seconds = max(0.0, now_value - self._buzzer_cycle_started_at)
+        return elapsed_seconds % cycle_seconds < profile.buzzer_seconds
+
+    def _reset_buzzer_cycle_locked(self) -> None:
+        """清除周期相位；最后租约结束、`/off` 或等级不再周期蜂鸣时调用。"""
+
+        self._buzzer_cycle_severity = None
+        self._buzzer_cycle_started_at = None
 
     def _select_effective_locked(self) -> str | None:
         """并发事故始终选择当前未过期的最高等级。"""
